@@ -8,7 +8,8 @@ class ListingJob(Base):
     __tablename__ = "listing_jobs"
 
     id = Column(Integer, primary_key=True, index=True)
-    lpn = Column(String, unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    lpn = Column(String, index=True, nullable=False)
     asin = Column(String, index=True, nullable=True)
     ean = Column(String, index=True, nullable=True)
     query = Column(String, nullable=True)
@@ -23,6 +24,7 @@ class ListingPreview(Base):
     __tablename__ = "listing_previews"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     lpn = Column(String, index=True, nullable=False)
     category_id = Column(String, nullable=True)
     title = Column(String, nullable=False)
@@ -52,6 +54,7 @@ class ListingHistory(Base):
     __tablename__ = "listing_history"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     lpn = Column(String, index=True, nullable=False)
     asin = Column(String, index=True, nullable=True)
     item_name = Column(String, nullable=True)

@@ -23,22 +23,61 @@ def ensure_schema():
 
     inspector = inspect(engine)
     columns = {col["name"] for col in inspector.get_columns("listing_jobs")}
-    with engine.begin() as conn:
-        if "item_name" not in columns:
-            conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN item_name VARCHAR"))
-        if "ean" not in columns:
-            conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN ean VARCHAR"))
-        if "query" not in columns:
-            conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN query VARCHAR"))
-        if "condition_id" not in columns:
-            conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN condition_id VARCHAR"))
-        if "condition_name" not in columns:
-            conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN condition_name VARCHAR"))
-        if "image_paths" not in columns:
-            conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN image_paths TEXT"))
+
+    def rebuild_listing_jobs():
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE listing_jobs RENAME TO listing_jobs_old"))
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE listing_jobs (
+                        id INTEGER PRIMARY KEY,
+                        user_id INTEGER,
+                        lpn VARCHAR NOT NULL,
+                        asin VARCHAR,
+                        ean VARCHAR,
+                        query VARCHAR,
+                        item_name VARCHAR,
+                        condition_id VARCHAR,
+                        condition_name VARCHAR,
+                        image_paths TEXT,
+                        status VARCHAR NOT NULL DEFAULT 'pending'
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO listing_jobs (id, user_id, lpn, asin, ean, query, item_name, condition_id, condition_name, image_paths, status)
+                    SELECT id, NULL, lpn, asin, ean, query, item_name, condition_id, condition_name, image_paths, COALESCE(status,'pending') FROM listing_jobs_old
+                    """
+                )
+            )
+            conn.execute(text("DROP TABLE listing_jobs_old"))
+
+    if "user_id" not in columns:
+        rebuild_listing_jobs()
+    else:
+        # still ensure legacy columns exist
+        with engine.begin() as conn:
+            if "item_name" not in columns:
+                conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN item_name VARCHAR"))
+            if "ean" not in columns:
+                conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN ean VARCHAR"))
+            if "query" not in columns:
+                conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN query VARCHAR"))
+            if "condition_id" not in columns:
+                conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN condition_id VARCHAR"))
+            if "condition_name" not in columns:
+                conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN condition_name VARCHAR"))
+            if "image_paths" not in columns:
+                conn.execute(text("ALTER TABLE listing_jobs ADD COLUMN image_paths TEXT"))
 
     preview_cols = {col["name"] for col in inspector.get_columns("listing_previews")}
     with engine.begin() as conn:
+        if "user_id" not in preview_cols:
+            conn.execute(text("ALTER TABLE listing_previews ADD COLUMN user_id INTEGER"))
         if "category_id" not in preview_cols:
             conn.execute(text("ALTER TABLE listing_previews ADD COLUMN category_id VARCHAR"))
         if "condition_id" not in preview_cols:
@@ -54,6 +93,8 @@ def ensure_schema():
 
     hist_cols = {col["name"] for col in inspector.get_columns("listing_history")}
     with engine.begin() as conn:
+        if "user_id" not in hist_cols:
+            conn.execute(text("ALTER TABLE listing_history ADD COLUMN user_id INTEGER"))
         if "category_id" not in hist_cols:
             conn.execute(text("ALTER TABLE listing_history ADD COLUMN category_id VARCHAR"))
         if "condition_id" not in hist_cols:

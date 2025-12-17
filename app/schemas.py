@@ -80,6 +80,7 @@ class PoliciesResponse(BaseModel):
 
 
 class ListingJobOut(BaseModel):
+    id: int
     lpn: str
     asin: Optional[str] = None
     ean: Optional[str] = None
@@ -91,6 +92,7 @@ class ListingJobOut(BaseModel):
 
 
 class ListedItemOut(BaseModel):
+    id: int
     lpn: str
     asin: Optional[str] = None
     item_name: Optional[str] = None

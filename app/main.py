@@ -267,21 +267,17 @@ def ebay_status(user: User = Depends(get_user_or_401), db: Session = Depends(get
     )
 
 
-def get_account_context(db: Session, user_id: int | None = None) -> tuple[str, bool]:
-    query = db.query(EbayAuth)
-    if user_id:
-        query = query.filter(EbayAuth.user_id == user_id)
-    auth = query.first()
+def get_account_context(db: Session, user_id: int) -> tuple[str, bool]:
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Login erforderlich")
+    auth = db.query(EbayAuth).filter(EbayAuth.user_id == user_id).first()
     if auth and auth.access_token:
         return auth.account_name or "eBay Verbunden", True
     return "Sandbox Händlerkonto", False
 
 
-def get_active_ebay_auth(db: Session, user_id: Optional[int] = None) -> Optional[EbayAuth]:
-    query = db.query(EbayAuth)
-    if user_id:
-        query = query.filter(EbayAuth.user_id == user_id)
-    return query.first()
+def get_active_ebay_auth(db: Session, user_id: int) -> Optional[EbayAuth]:
+    return db.query(EbayAuth).filter(EbayAuth.user_id == user_id).first()
 
 
 LANDING_PAGE = """
@@ -1004,7 +1000,7 @@ def root(request: Request):
 
 
 @app.post("/ingest/preview", response_model=CSVPreviewResult)
-def preview_ingest(file: UploadFile = File(...)):
+def preview_ingest(file: UploadFile = File(...), user: User = Depends(get_user_or_401)):
     try:
         content = file.file.read().decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -1027,7 +1023,7 @@ def preview_ingest(file: UploadFile = File(...)):
 
 @app.post("/ingest", response_model=CSVIngestResult)
 def ingest_csv(
-    file: UploadFile = File(...), column_map: Optional[str] = Form(None), use_header: Optional[str] = Form(None), db: Session = Depends(get_db)
+    file: UploadFile = File(...), column_map: Optional[str] = Form(None), use_header: Optional[str] = Form(None), db: Session = Depends(get_db), user: User = Depends(get_user_or_401)
 ):
     try:
         content = file.file.read().decode("utf-8")
@@ -1056,11 +1052,11 @@ def ingest_csv(
 
         if not lpn:
             continue
-        if db.query(ListingJob).filter(ListingJob.lpn == lpn).first():
+        if db.query(ListingJob).filter(ListingJob.lpn == lpn, ListingJob.user_id == user.id).first():
             skipped.append(lpn)
             continue
 
-        job = ListingJob(lpn=lpn, asin=asin or None, item_name=item_name or None)
+        job = ListingJob(lpn=lpn, asin=asin or None, item_name=item_name or None, user_id=user.id)
         db.add(job)
         imported += 1
 
@@ -1069,7 +1065,7 @@ def ingest_csv(
 
 
 @app.post("/jobs/create", response_model=ListingJobOut)
-def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
+def create_job(payload: JobCreateRequest, db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
     lpn = _materialize_lpn(payload.lpn)
     asin = (payload.asin or "").strip() or None
     ean = (payload.ean or "").strip() or None
@@ -1080,7 +1076,7 @@ def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
     if not asin and not (ean or query):
         raise HTTPException(status_code=400, detail="Mindestens EAN oder Artikelsuche erforderlich, wenn keine ASIN vorhanden ist.")
 
-    if db.query(ListingJob).filter(ListingJob.lpn == lpn).first():
+    if db.query(ListingJob).filter(ListingJob.lpn == lpn, ListingJob.user_id == user.id).first():
         raise HTTPException(status_code=400, detail="LPN bereits vorhanden")
 
     job = ListingJob(
@@ -1091,12 +1087,14 @@ def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
         item_name=item_name,
         condition_id=cond_id,
         condition_name=cond_name,
+        user_id=user.id,
         status="pending",
     )
     db.add(job)
     db.commit()
     db.refresh(job)
     return ListingJobOut(
+        id=job.id,
         lpn=job.lpn,
         asin=job.asin,
         ean=job.ean,
@@ -1129,8 +1127,13 @@ def build_preview(
     listing: ListingRequest,
     db: Session = Depends(get_db),
     request: Request = None,
+    user: User = Depends(get_user_or_401),
 ):
-    job = db.query(ListingJob).filter(ListingJob.lpn == listing.lpn).first()
+    job = (
+        db.query(ListingJob)
+        .filter(ListingJob.lpn == listing.lpn, ListingJob.user_id == user.id)
+        .first()
+    )
     if not job:
         raise HTTPException(status_code=404, detail="LPN nicht gefunden")
 
@@ -1170,12 +1173,12 @@ def build_preview(
     title = ai_result["title"]
     description = ai_result["description"]
 
-    user = current_user_optional(request, db) if request else None
-    account_label, _ = get_account_context(db, user_id=user.id if user else None)
+    account_label, _ = get_account_context(db, user_id=user.id)
     profile = ebay.account_profile(account_label)
     promotion = "Automatische Werbung: 3%" if price != "N/A" else "N/A"
 
     preview = ListingPreview(
+        user_id=user.id,
         lpn=job.lpn,
         title=title,
         description=description,
@@ -1224,15 +1227,112 @@ def build_preview(
     )
 
 
+@app.post("/jobs/{job_id}/publish")
+def publish_job(job_id: int, payload: dict = Body(...), db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
+    job = db.query(ListingJob).filter(ListingJob.id == job_id, ListingJob.user_id == user.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+
+    preview = db.query(ListingPreview).filter(ListingPreview.lpn == job.lpn, ListingPreview.user_id == user.id).first()
+    if not preview:
+        raise HTTPException(status_code=400, detail="Kein Preview vorhanden")
+
+    auth = get_active_ebay_auth(db, user.id)
+    if not auth or not auth.access_token:
+        raise HTTPException(status_code=400, detail="eBay nicht verknüpft")
+
+    fulfillment_policy_id = payload.get("fulfillment_policy_id")
+    if not (auth.payment_policy_id and auth.return_policy_id and fulfillment_policy_id):
+        raise HTTPException(status_code=400, detail="Versand-/Zahlungs-/Rücknahme-Policies fehlen")
+
+    if not preview.category_id:
+        raise HTTPException(status_code=400, detail="Kategorie fehlt im Preview")
+    if not preview.condition_id:
+        raise HTTPException(status_code=400, detail="Zustand fehlt")
+
+    images = preview.images.split(",") if preview.images else []
+    if not images:
+        raise HTTPException(status_code=400, detail="Mindestens ein Bild erforderlich")
+
+    try:
+        price_value = float(preview.price)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Preis ungültig oder fehlt") from exc
+
+    aspects = json.loads(preview.article_attributes or "{}")
+
+    sku = job.lpn
+    product_payload = {
+        "availability": {"shipToLocationAvailability": {"quantity": 1}},
+        "condition": preview.condition_id,
+        "product": {
+            "title": preview.title,
+            "description": preview.description,
+            "aspects": aspects,
+            "imageUrls": images,
+        },
+    }
+
+    offer_payload = {
+        "sku": sku,
+        "marketplaceId": ebay.DEFAULT_MARKETPLACE,
+        "format": "FIXED_PRICE",
+        "availableQuantity": 1,
+        "pricingSummary": {"price": {"value": price_value, "currency": "EUR"}},
+        "listingPolicies": {
+            "fulfillmentPolicyId": fulfillment_policy_id,
+            "paymentPolicyId": auth.payment_policy_id,
+            "returnPolicyId": auth.return_policy_id,
+        },
+        "categoryId": preview.category_id,
+    }
+
+    try:
+        ebay.create_or_replace_inventory_item(sku, product_payload, auth.access_token)
+        offer_id = ebay.create_offer(offer_payload, auth.access_token)
+        if not offer_id:
+            raise HTTPException(status_code=500, detail="Offer konnte nicht erstellt werden")
+        listing_id = ebay.publish_offer(offer_id, auth.access_token)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - runtime failures
+        raise HTTPException(status_code=500, detail=f"eBay Publish fehlgeschlagen: {exc}") from exc
+
+    history_entry = ListingHistory(
+        user_id=user.id,
+        lpn=job.lpn,
+        asin=job.asin,
+        item_name=job.item_name,
+        category_id=preview.category_id,
+        condition_id=preview.condition_id,
+        condition_name=preview.condition_name,
+        ebay_listing_id=listing_id,
+        price=str(price_value),
+        listed_at=datetime.utcnow().isoformat(timespec="seconds"),
+    )
+    db.add(history_entry)
+
+    db.query(ListingPreview).filter(ListingPreview.id == preview.id).delete()
+    db.delete(job)
+    db.commit()
+
+    return {"status": "listed", "offer_id": offer_id, "listing_id": listing_id}
+
+
 @app.post("/finalize")
-def finalize_listing(request: ListingRequest, db: Session = Depends(get_db)):
-    job = db.query(ListingJob).filter(ListingJob.lpn == request.lpn).first()
+def finalize_listing(request: ListingRequest, db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
+    job = (
+        db.query(ListingJob)
+        .filter(ListingJob.lpn == request.lpn, ListingJob.user_id == user.id)
+        .first()
+    )
     if not job:
         raise HTTPException(status_code=404, detail="LPN nicht gefunden")
 
-    db.query(ListingPreview).filter(ListingPreview.lpn == request.lpn).delete()
+    db.query(ListingPreview).filter(ListingPreview.lpn == request.lpn, ListingPreview.user_id == user.id).delete()
 
     history_entry = ListingHistory(
+        user_id=user.id,
         lpn=job.lpn,
         asin=job.asin,
         item_name=job.item_name,
@@ -1246,17 +1346,21 @@ def finalize_listing(request: ListingRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/database/reset")
-def reset_database(db: Session = Depends(get_db)):
-    db.query(ListingPreview).delete()
-    db.query(ListingHistory).delete()
-    db.query(ListingJob).delete()
+def reset_database(db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
+    db.query(ListingPreview).filter(ListingPreview.user_id == user.id).delete()
+    db.query(ListingHistory).filter(ListingHistory.user_id == user.id).delete()
+    db.query(ListingJob).filter(ListingJob.user_id == user.id).delete()
     db.commit()
     return {"message": "Datenbank geleert und bereit für neuen CSV-Import"}
 
 
 @app.get("/lookup/{lpn}", response_model=LpnLookupResponse)
-def lookup_lpn(lpn: str, db: Session = Depends(get_db)):
-    job = db.query(ListingJob).filter(ListingJob.lpn == lpn).first()
+def lookup_lpn(lpn: str, db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
+    job = (
+        db.query(ListingJob)
+        .filter(ListingJob.lpn == lpn, ListingJob.user_id == user.id)
+        .first()
+    )
     if job:
         preview = db.query(ListingPreview).filter(ListingPreview.lpn == lpn).first()
         status = "previewed" if preview else job.status
@@ -1268,7 +1372,11 @@ def lookup_lpn(lpn: str, db: Session = Depends(get_db)):
             location="jobs",
         )
 
-    listed = db.query(ListingHistory).filter(ListingHistory.lpn == lpn).first()
+    listed = (
+        db.query(ListingHistory)
+        .filter(ListingHistory.lpn == lpn, ListingHistory.user_id == user.id)
+        .first()
+    )
     if listed:
         return LpnLookupResponse(
             lpn=listed.lpn,
@@ -1283,10 +1391,16 @@ def lookup_lpn(lpn: str, db: Session = Depends(get_db)):
 
 
 @app.get("/jobs", response_model=List[ListingJobOut])
-def list_jobs(db: Session = Depends(get_db)):
-    jobs = db.query(ListingJob).order_by(ListingJob.id.asc()).all()
+def list_jobs(db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
+    jobs = (
+        db.query(ListingJob)
+        .filter(ListingJob.user_id == user.id)
+        .order_by(ListingJob.id.asc())
+        .all()
+    )
     return [
         ListingJobOut(
+            id=j.id,
             lpn=j.lpn,
             asin=j.asin,
             ean=j.ean,
@@ -1301,8 +1415,12 @@ def list_jobs(db: Session = Depends(get_db)):
 
 
 @app.delete("/jobs/{lpn}")
-def delete_job(lpn: str, db: Session = Depends(get_db)):
-    job = db.query(ListingJob).filter(ListingJob.lpn == lpn).first()
+def delete_job(lpn: str, db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
+    job = (
+        db.query(ListingJob)
+        .filter(ListingJob.lpn == lpn, ListingJob.user_id == user.id)
+        .first()
+    )
     if not job:
         raise HTTPException(status_code=404, detail="LPN nicht gefunden")
 
@@ -1313,17 +1431,38 @@ def delete_job(lpn: str, db: Session = Depends(get_db)):
 
 
 @app.get("/listed", response_model=List[ListedItemOut])
-def list_listed(db: Session = Depends(get_db)):
-    items = db.query(ListingHistory).order_by(ListingHistory.id.asc()).all()
+def list_listed(db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
+    items = (
+        db.query(ListingHistory)
+        .filter(ListingHistory.user_id == user.id)
+        .order_by(ListingHistory.id.asc())
+        .all()
+    )
     return [
-        ListedItemOut(lpn=i.lpn, asin=i.asin, item_name=i.item_name, listed_at=i.listed_at)
+        ListedItemOut(
+            id=i.id,
+            lpn=i.lpn,
+            asin=i.asin,
+            item_name=i.item_name,
+            listed_at=i.listed_at,
+            category_id=i.category_id,
+            condition_id=i.condition_id,
+            condition_name=i.condition_name,
+            ebay_listing_id=i.ebay_listing_id,
+            price=i.price,
+        )
         for i in items
     ]
 
 
 @app.get("/previews", response_model=List[ListingPreviewResponse])
-def list_previews(db: Session = Depends(get_db)):
-    previews = db.query(ListingPreview).order_by(ListingPreview.id.desc()).all()
+def list_previews(db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
+    previews = (
+        db.query(ListingPreview)
+        .filter(ListingPreview.user_id == user.id)
+        .order_by(ListingPreview.id.desc())
+        .all()
+    )
     response: List[ListingPreviewResponse] = []
     for preview in previews:
         response.append(
@@ -1353,17 +1492,21 @@ def list_previews(db: Session = Depends(get_db)):
 
 
 @app.get("/dashboard", response_model=DashboardStats)
-def dashboard(db: Session = Depends(get_db)):
-    total_jobs = db.query(ListingJob).count()
-    pending_jobs = db.query(ListingJob).filter(ListingJob.status != "listed").count()
-    listings_created = db.query(ListingHistory).count()
-    account_label, ebay_linked = get_account_context(db)
+def dashboard(db: Session = Depends(get_db), user: User = Depends(get_user_or_401)):
+    total_jobs = db.query(ListingJob).filter(ListingJob.user_id == user.id).count()
+    pending_jobs = (
+        db.query(ListingJob)
+        .filter(ListingJob.user_id == user.id)
+        .filter(ListingJob.status != "listed")
+        .count()
+    )
+    listings_created = db.query(ListingHistory).filter(ListingHistory.user_id == user.id).count()
+    account_label, ebay_linked = get_account_context(db, user_id=user.id)
     profile = ebay.account_profile(account_label)
-    active_user = db.query(User).first()
 
     return DashboardStats(
         active_account=profile["account_label"],
-        active_user=active_user.email if active_user else None,
+        active_user=user.email,
         listings_created=listings_created,
         total_jobs=total_jobs,
         last_import_count=total_jobs,
